@@ -41,7 +41,10 @@ static void initAni() { ANI["chicken"] = {4, 22, 1, false, {{"raw_meat", 1, 1}, 
   ANI["pig"] = {10, 18, 0, false, {{"raw_meat", 2, 3}}, {"carrot", "pumpkin"}, ""}; ANI["rabbit"] = {3, 46, 2, false, {{"raw_meat", 1, 1}, {"leather", 0, 1}}, {"carrot"}, ""}; ANI["deer"] = {10, 52, 2, false, {{"raw_meat", 2, 2}, {"leather", 1, 2}}, {"apple"}, ""};
   ANI["fox"] = {6, 58, 2, false, {{"leather", 0, 1}, {"bone", 0, 1}}, {"raw_meat"}, ""}; ANI["boar"] = {16, 40, 0, true, {{"raw_meat", 2, 3}, {"leather", 1, 1}}, {"mushroom"}, ""}; }
 struct Goal2 { double x, y; std::string task; };
-struct Ent {
+struct Ent : std::enable_shared_from_this<Ent> {
+  // ---- locomotion (v5): smoothed velocity, distance-driven gait phase, facing hysteresis, stuck watchdog ----
+  double svx = 0, svy = 0, mspd = 0, ph = 0, gait = 0, turnCd = 0, avoidT = 0, avoidA = 0, progT = 0, px0 = 0, py0 = 0, lx = 0, ly = 0, kbStep = 0, repathCd = 0, pathGx = 1e9, pathGy = 1e9, offT = 0, lungeT = 0, alertT = 0, jinkT = 0, restT = 0, hopZ = 0;
+  int stuckN = 0, avoidSide = 1; bool walking = false, steered = false, failed = false, hitX = false, hitY = false, lxInit = false, follow = false, fleeing = false;
   Game* g; int kind; double x, y, vx = 0, vy = 0, z = 0, vz = 0, r = 4, hp = 10, maxHp = 10; bool dead = false; int dir = 0; double t = 0, flash = 0, kbx = 0, kby = 0; int id; std::string team = "nature"; double speed = 40; bool solidEnt = true, persist = false, swims = false, noWater = false, moving = false, isPlayer = false;
   double atkCd = 0, stuck = 0, ifr = 0; EP target; std::vector<std::pair<int, int>> path; int wlT = -1, wl = 0; bool wasWet = false; double rip = 0;
   // humanoid
@@ -64,7 +67,14 @@ struct Ent {
   inline bool hasTeam(const char* p) const { return team.compare(0, strlen(p), p) == 0; }
   bool isHuman() const { return kind == E_PLAYER || kind == E_VILLAGER || kind == E_SOLDIER || kind == E_ZOMBIE; }
   bool blocked(double px, double py);
-  bool move(double dx, double dy) { bool hit = false; if (dx != 0) { if (!blocked(x + dx, y)) x += dx; else hit = true; } if (dy != 0) { if (!blocked(x, y + dy)) y += dy; else hit = true; } return hit; }
+  // axis-separated move with corner assist: when clipped by a tile edge, slide toward the nearest opening (<=5px) so nothing snags on trees/house corners
+  bool move(double dx, double dy, bool assist = true) { hitX = hitY = false;
+    if (dx != 0) { if (!blocked(x + dx, y)) x += dx; else { hitX = true; if (assist) nudge(0, dx); } }
+    if (dy != 0) { if (!blocked(x, y + dy)) y += dy; else { hitY = true; if (assist) nudge(1, dy); } } return hitX || hitY; }
+  void nudge(int axis, double d) { double m = std::min(1.6, std::fabs(d) * 1.25 + 0.2); for (int k = 1; k <= 5; k++) for (int s = -1; s <= 1; s += 2) { double ox = axis == 1 ? s * k : 0, oy = axis == 0 ? s * k : 0; if (blocked(x + (axis == 0 ? d : 0) + ox, y + (axis == 1 ? d : 0) + oy)) continue; double st = std::min((double)k, m); if (!blocked(x + (axis == 1 ? s * st : 0), y + (axis == 0 ? s * st : 0))) { if (axis == 1) x += s * st; else y += s * st; return; } } }
+  void face(double dx, double dy, bool force = false) { double ax = std::fabs(dx), ay = std::fabs(dy); if (ax + ay < 1e-4) return; int nd = dirOf(dx, dy); if (nd == dir) return; if (!force) { bool hz = dir & 1; double cur = hz ? ax : ay, oth = hz ? ay : ax; if (cur >= oth * 0.72 || turnCd > 0) return; } dir = nd; turnCd = 0.14; }
+  void faceX(double dx) { if (dx > 2.5) f = 1; else if (dx < -2.5) f = -1; }
+  void drive(double ux, double uy, double sp, double dt, double accel = 11); void sampleMotion(double dt); double stride() const;
   int waterLevel(); void waterFx(double dt); void physics(double dt); bool hurt(double dmg, Ent* src, double kb = 90); bool seek(double tx, double ty, double sp, double dt, double stopAt = 2);
   void update(double dt); void die(Ent* src); void onHurt(Ent* src); void say(const std::string& s, double tt = 3) { bubble = s; bubbleT = tt; } void swing(double d = 0.32) { actT = actDur = d; }
   // player
@@ -117,18 +127,23 @@ struct Game {
   EP dropItem(const std::string& id, int n, double x, double y);
   void activateVillages(bool force = false);
   /* ---- queries ---- */
-  void rebuildGrid() { grid.clear(); for (auto& e : ents) { if (e->dead || e->kind == E_DROP) continue; i64 k = pkey((int)std::floor(e->x / 64), (int)std::floor(e->y / 64)); grid[k].push_back(e.get()); } }
+  void rebuildGrid() { for (auto it = grid.begin(); it != grid.end();) { if (it->second.empty() && ++gridIdle[it->first] > 600) { gridIdle.erase(it->first); it = grid.erase(it); } else { it->second.clear(); ++it; } }
+    for (auto& e : ents) { if (e->dead || e->kind == E_DROP) continue; i64 k = pkey((int)std::floor(e->x / 64), (int)std::floor(e->y / 64)); grid[k].push_back(e.get()); } } std::unordered_map<i64, int> gridIdle;
   template <class F> std::vector<Ent*> query(double x, double y, double r, F f) { std::vector<Ent*> out; int c0 = (int)std::floor((x - r) / 64), c1 = (int)std::floor((x + r) / 64), r0 = (int)std::floor((y - r) / 64), r1 = (int)std::floor((y + r) / 64); double r2 = r * r;
     for (int cy = r0; cy <= r1; cy++) for (int cx = c0; cx <= c1; cx++) { auto it = grid.find(pkey(cx, cy)); if (it == grid.end()) continue; for (Ent* e : it->second) if (!e->dead && dist2d(e->x, e->y, x, y) <= r2 && f(e)) out.push_back(e); }
     Ent* p = player.get(); if (p && !p->dead && dist2d(p->x, p->y, x, y) <= r2 && f(p) && std::find(out.begin(), out.end(), p) == out.end()) out.push_back(p); return out; }
-  template <class F> Ent* nearest(double x, double y, double r, F f) { Ent* best = nullptr; double bd = 1e18; for (Ent* e : query(x, y, r, f)) { double d = dist2d(e->x, e->y, x, y); if (d < bd) { bd = d; best = e; } } return best; }
-  EP sp(Ent* e) { if (e == player.get()) return player; for (auto& q : ents) if (q.get() == e) return q; return nullptr; }
+  // allocation-free visitors (hot paths: AI target scans, separation)
+  template <class F> void query2(double x, double y, double r, F f) { int c0 = (int)std::floor((x - r) / 64), c1 = (int)std::floor((x + r) / 64), r0 = (int)std::floor((y - r) / 64), r1 = (int)std::floor((y + r) / 64); double r2 = r * r;
+    for (int cy = r0; cy <= r1; cy++) for (int cx = c0; cx <= c1; cx++) { auto it = grid.find(pkey(cx, cy)); if (it == grid.end()) continue; for (Ent* e : it->second) if (!e->dead && dist2d(e->x, e->y, x, y) <= r2) f(e); } }
+  template <class F> Ent* nearest(double x, double y, double r, F f) { Ent* best = nullptr; double bd = 1e18; Ent* p = player.get(); query2(x, y, r, [&](Ent* e) { double d = dist2d(e->x, e->y, x, y); if (d < bd && f(e)) { bd = d; best = e; } });
+    if (p && !p->dead) { double d = dist2d(p->x, p->y, x, y); if (d <= r * r && d < bd && f(p)) { bool inGrid = false; (void)inGrid; best = p; } } return best; }
+  EP sp(Ent* e) { if (!e) return nullptr; if (e == player.get()) return player; return e->weak_from_this().lock(); }
   bool hostile(Ent* a, Ent* b);
   bool holding(const std::vector<std::string>& foods) { Stack& s = player->inv[player->sel]; return !s.empty() && std::find(foods.begin(), foods.end(), s.id) != foods.end(); }
   bool entAtTile(int tx, int ty) { for (auto& e : ents) if (!e->dead && e->solidEnt && e->kind != E_DROP && e->kind != E_ARROW && e->tx() == tx && e->ty() == ty) return true; return player->tx() == tx && player->ty() == ty; }
   float pan(double x) { return (float)clampf((float)((x - player->x) / 200), -1, 1); } float vol(double x, double y) { return (float)clampf((float)(1 - std::hypot(x - player->x, y - player->y) / 260), 0, 1); }
   bool aimValid() const { return IN.mouseOn && modal == M_NONE; } void aimWorld(double& ax, double& ay) { ax = camX + IN.mx / scale; ay = camY + IN.my / scale; }
-  std::vector<std::pair<int, int>> findPath(int sx, int sy, int tx, int ty);
+  std::vector<std::pair<int, int>> findPath(int sx, int sy, int tx, int ty, bool avoidWater = false);
   bool lit(int tx, int ty) { for (int y = ty - 5; y <= ty + 5; y++) for (int x = tx - 5; x <= tx + 5; x++) { int o = world.obj(x, y); if (o && OBJ[o].light) return true; } return false; }
   /* ---- world interaction ---- */
   void pickup(Ent* d); void shootArrow(Ent* src, double tx, double ty, double dmg); bool useTool(int tx, int ty, Item* it, Ent* src); void damageTile(int tx, int ty, double pow, Ent* src, bool zombie = false); void breakBlock(int tx, int ty, int b); void breakObj(int tx, int ty, int o, int m); void harvest(int tx, int ty);

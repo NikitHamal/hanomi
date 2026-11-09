@@ -1,0 +1,19 @@
+new 777
+wait 30
+tp 6 4
+wait 60
+spawn cow
+spawn sheep
+spawn pig
+spawn chicken
+spawn rabbit
+spawn deer
+spawn fox
+spawn boar
+spawn wolf
+spawn dog shiba
+wait 120
+perf
+audit 7200
+perf
+stat

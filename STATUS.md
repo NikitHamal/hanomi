@@ -2,7 +2,20 @@
 
 Goal: public `NikitHamal/hanomi` repo + GitHub Pages web original (repo root) + a native C++ Windows rebuild that is **the same game, same sprites, same world**, only lighter and smoother.
 
-## v2 (current) — 1:1 port of the web game
+## v5 (latest) — locomotion / animation / AI overhaul (this session)
+**Problem reported:** animals/humans get stuck, "walk in place", flicker between facings/animations.
+**Root causes found (measured with the new `audit` QA command, `native/qa/motion.txt`):** facing recomputed raw every frame from the goal vector (flips at 45°); walk anim keyed to a boolean `moving` that stayed true while pinned on a wall; walk frame = `t*fps` (feet slide, jump at state changes); A* paths ignored `noWater` so animals routed into water then treadmilled; cornered flee loop never ended (one animal stuck 120 s); separation was frame-rate dependent and fought the steering; villagers retreated facing *toward* the zombie.
+**Fix (native/src/game.h, logic.h, render.h):**
+- `Ent::drive()/seek()`: smoothed velocity, whisker obstacle avoidance that commits to a side, wall sliding, corner-assist `move()` (slides ≤5 px round tile corners), hysteretic facing with turn cooldown, displacement-based stuck watchdog (sidestep → repath → abandon goal), eased arrival, stale-path invalidation, water-aware A*.
+- `sampleMotion()`: `walking` (hysteresis + off-delay) and `ph` (gait phase advanced by **real distance**) drive animation: feet plant, no idle/walk flicker, never animates against a wall. Knockback/teleports excluded.
+- AI: animals alert → flee with herd alarm, rabbits/chickens zig-zag, cornered animals freeze instead of treadmilling, babies follow adults, livestock stay near their pasture, wild foxes hunt wild rabbits/chickens (rest after kill), dogs follow with start/stop hysteresis and puff teleport, wolves stalk then lunge and drift as packs, villagers flee facing away.
+- Render: sprite frames from gait phase; dogs never "run" in place; rabbit/chicken hop arcs; goal chip HUD.
+- Perf: allocation-free `query2/nearest`, grid buffers reused, O(1) `sp()`, dt-scaled separation (avg 2.9 ms/frame headless incl. software raster).
+**Measured (8 animals + 6 villagers + dogs, 2 min, `audit`):** animals walking-in-place 40 % → ~2 % (longest stuck 120 s → 0.1 s); villager moving-toggles 60/min → 7/min; facing flips animals 17 → 8/min.
+**Visual QA:** web reference shots (Playwright/Chromium) vs native shots compared: scene layout, house, player/dog sprites, cobble, lanterns, hotbar identical; differences are the web seed (random) and the web's sun/moon clock dial + circular minimap + intro banner (backlog).
+**Backlog (next):** sun/moon clock dial & round minimap styling, intro "Welcome home" banner, ground sparrows, chunk bake worker thread, 8-direction walk frames, sleeping animals at night, satchel tabs.
+
+## v2 — 1:1 port of the web game
 V1 used invented procedural art and looked nothing like the web game. V2 is a faithful port:
 
 | Layer | How it matches the web game |

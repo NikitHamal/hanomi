@@ -17,7 +17,8 @@ void Ent::waterFx(double dt) { int w = waterLevel(); if (w && !wasWet) { g->fx.b
   rip -= dt; if (rip <= 0) { rip = moving ? 0.22 : 0.9; SpawnO o; o.x = x; o.y = y - (w == 2 ? 4 : 1); o.life = moving ? 0.6 : 1.1; o.k = "ring"; o.s = w == 2 ? 9 : 6; o.c = C3(0xe8fbff); g->fx.spawn(o);
     if (moving) for (int k = 0; k < (w == 2 ? 3 : 2); k++) { SpawnO p; p.x = x + rndr(-5, 5); p.y = y - 2; p.z = 2; p.vz = rndr(20, 45); p.vx = rndr(-14, 14); p.g = 160; p.life = 0.45; p.c = rnd() < 0.5 ? C3(0xffffff) : C3(0xbfe7f4); g->fx.spawn(p); } } }
 void Ent::physics(double dt) {
-  if (kbx != 0 || kby != 0) { move(kbx * dt, kby * dt); double d = std::pow(0.002, dt); kbx *= d; kby *= d; if (std::fabs(kbx) + std::fabs(kby) < 2) kbx = kby = 0; }
+  if (turnCd > 0) turnCd -= dt; if (repathCd > 0) repathCd -= dt;
+  if (kbx != 0 || kby != 0) { double ox = x, oy = y; move(kbx * dt, kby * dt, false); kbStep += std::hypot(x - ox, y - oy); double d = std::pow(0.002, dt); kbx *= d; kby *= d; if (std::fabs(kbx) + std::fabs(kby) < 2) kbx = kby = 0; }
   if (z > 0 || vz != 0) { vz -= 300 * dt; z += vz * dt; if (z <= 0) { z = 0; vz = 0; } } if (flash > 0) flash -= dt; if (atkCd > 0) atkCd -= dt; if (ifr > 0) ifr -= dt;
   if (isHuman()) { waterFx(dt); if (bubbleT > 0) { bubbleT -= dt; if (bubbleT <= 0) bubble.clear(); } if (actT > 0) actT -= dt; t += dt; } else if (kind == E_DOG) { waterFx(dt); st += dt; t += dt; } else if (kind == E_ANIMAL) { st -= dt; t += dt; } }
 bool Ent::hurt(double d, Ent* src, double kb) {
@@ -37,12 +38,35 @@ void Ent::die(Ent*) {
   if (kind == E_ZOMBIE) { if (rnd() < 0.6) g->dropItem("rotten", 1, x, y); if (rnd() < 0.3) g->dropItem("bone", 1, x, y); if (rnd() < 0.45) g->dropItem("coin", rndi(1, 3 + zkind * 2), x, y); if (zkind == 2 && rnd() < 0.5) g->dropItem("iron", 1, x, y); snd("zombieDie", g->vol(x, y), 1, g->pan(x)); g->fx.burst(x, y - 8, 12, {C3(0x5a7a4a), C3(0x3a4a3a), C3(0x8a9a7a)}, 15, 70); }
   else if (kind == E_ANIMAL) { if (def()) for (auto& d : def()->drops) { int n = baby > 0 ? 0 : rndi(d.a, d.b); if (n) g->dropItem(d.id, n, x, y); } }
   else if (kind == E_DOG && wild) { if (rnd() < 0.5) g->dropItem("leather", 1, x, y); g->dropItem("bone", 1, x, y); } else if (kind == E_PLAYER) alive = false; }
+/* ---- locomotion core (v5) ----
+   drive(): steer along a heading with smoothed acceleration, whisker obstacle avoidance (commits to a side so it never dithers),
+            wall sliding, hysteretic facing, and a displacement-based stuck watchdog (stuckN escalates: sidestep -> repath -> give up).
+   seek():  waypoint following + eased arrival on top of drive(); returns true on arrival OR when the goal is abandoned (failed=true).
+   sampleMotion(): measures *real* displacement; `walking` (hysteresis) and `ph` (gait phase in cycles, advanced by distance) drive animation,
+            so legs never slide, never play while pinned against a wall, and never flicker between idle/walk. */
+void Ent::drive(double ux, double uy, double sp, double dt, double accel) {
+  double l = std::hypot(ux, uy); if (l < 1e-6) return; ux /= l; uy /= l; steered = true;
+  if (avoidT > 0) { avoidT -= dt; ux = std::cos(avoidA); uy = std::sin(avoidA); }
+  else { double pr = r + 3; if (blocked(x + ux * pr, y + uy * pr)) { double base = std::atan2(uy, ux); static const double AN[6] = {0.6, 1.1, 1.6, 2.1, 2.6, 3.1}; bool ok = false;
+      for (int i = 0; i < 6 && !ok; i++) for (int s2 = 0; s2 < 2 && !ok; s2++) { int sg = s2 == 0 ? avoidSide : -avoidSide; double a = base + sg * AN[i]; double cx = std::cos(a), cy = std::sin(a); if (!blocked(x + cx * pr, y + cy * pr) && !blocked(x + cx * (pr + 6), y + cy * (pr + 6))) { avoidA = a; avoidT = 0.28; avoidSide = sg; ux = cx; uy = cy; ok = true; } } } }
+  int w = waterLevel(); double wm = w == 2 ? 0.5 : w ? 0.7 : 1; double a = 1 - std::exp(-dt * accel); svx += (ux * sp * wm - svx) * a; svy += (uy * sp * wm - svy) * a;
+  move(svx * dt, svy * dt); if (hitX) svx = 0; if (hitY) svy = 0; moving = true; offT = 0; double vs = std::hypot(svx, svy); if (vs > 5) { face(svx, svy); faceX(svx); } else { face(ux, uy); faceX(ux); }
+  progT += dt; if (progT >= 0.6) { double mv = std::hypot(x - px0, y - py0); px0 = x; py0 = y; progT = 0; if (mv < sp * 0.6 * 0.3) { stuckN++; if (stuckN == 1) { avoidA = std::atan2(uy, ux) + avoidSide * 1.57; avoidT = 0.55; avoidSide = -avoidSide; } } else stuckN = 0; } }
 bool Ent::seek(double tx_, double ty_, double sp, double dt, double stopAt) {
-  double gx = tx_, gy = ty_; if (!path.empty()) { auto n = path[0]; gx = n.first * TS + 8; gy = n.second * TS + 12; if (dist2d(x, y, gx, gy) < 25) path.erase(path.begin()); }
-  double dx = gx - x, dy = gy - y, d = std::hypot(dx, dy); if (d < stopAt && path.empty()) { moving = false; return true; }
-  int w = waterLevel(); double k = (w == 2 ? 0.5 : w ? 0.7 : 1) * sp * dt / (d ? d : 1); double ox = x, oy = y; move(dx * k, dy * k); dir = dirOf(dx, dy); moving = true; double moved = std::fabs(x - ox) + std::fabs(y - oy);
-  if (moved < sp * dt * 0.3) { stuck += dt; if (stuck > 0.45) { stuck = 0; path = g->findPath(tx(), ty(), (int)std::floor(tx_ / TS), (int)std::floor(ty_ / TS)); } } else stuck = std::max(0.0, stuck - dt);
-  if (kind == E_DOG && std::fabs(tx_ - x) > 2) f = tx_ > x ? 1 : -1; return false; }
+  double gx = tx_, gy = ty_; failed = false;
+  if (!path.empty() && dist2d(tx_, ty_, pathGx, pathGy) > 2304) path.clear();
+  while (!path.empty()) { double wx = path[0].first * TS + 8, wy = path[0].second * TS + 12; if (dist2d(x, y, wx, wy) < 36) path.erase(path.begin()); else { gx = wx; gy = wy; break; } }
+  double fd = std::hypot(tx_ - x, ty_ - y); if (path.empty() && fd < stopAt) { moving = false; stuckN = 0; return true; }
+  double sc = path.empty() ? std::min(1.0, 0.4 + fd / 14.0) : 1.0; drive(gx - x, gy - y, sp * sc, dt, isHuman() ? 14 : 9);
+  if (stuckN >= 2 && repathCd <= 0 && path.empty()) { repathCd = 1.6; path = g->findPath(tx(), ty(), (int)std::floor(tx_ / TS), (int)std::floor(ty_ / TS), noWater); pathGx = tx_; pathGy = ty_; if (!path.empty()) stuckN = 1; }
+  if (stuckN >= 4) { stuckN = 0; path.clear(); failed = true; moving = false; return true; } return false; }
+double Ent::stride() const { switch (kind) { case E_DOG: return state == "run" ? 26 : 22; case E_ANIMAL: { if (akind == "chicken") return 7; if (akind == "rabbit") return 12; if (akind == "cow") return 14; if (akind == "deer") return 17; if (akind == "fox") return 13; return 11; } default: return isPlayer ? 25 : 20; } }
+void Ent::sampleMotion(double dt) {
+  if (!lxInit) { lx = x; ly = y; lxInit = true; px0 = x; py0 = y; } double d = std::hypot(x - lx, y - ly) - kbStep; if (d < 0) d = 0; kbStep = 0; if (d > 24) d = 0; /* teleport */
+  double sp = d / dt; mspd += (sp - mspd) * std::min(1.0, dt * 16);
+  if (!walking) { if (mspd > 3.2) { walking = true; offT = 0; } } else { if (mspd < 1.6) { offT += dt; if (offT > 0.07) walking = false; } else offT = 0; }
+  if (walking) ph += d / stride(); gait += ((walking ? 1.0 : 0.0) - gait) * std::min(1.0, dt * 10);
+  if (!steered) { double k = std::exp(-dt * 12); svx *= k; svy *= k; progT = 0; px0 = x; py0 = y; stuckN = 0; avoidT = 0; } steered = false; }
 // ---- inventory
 bool Ent::add(const std::string& id, int n) { Item* it = itm(id); if (!it) return n; for (auto& s : inv) { if (n <= 0) break; if (!s.empty() && s.id == id && s.n < it->st) { int k = std::min(n, it->st - s.n); s.n += k; n -= k; } }
   for (auto& s : inv) { if (n <= 0) break; if (s.empty()) { int k = std::min(n, it->st); s.id = id; s.n = k; s.d = it->dur; n -= k; } } return n; }
@@ -59,12 +83,12 @@ void Ent::updateVillager(double dt) {
   physics(dt); bool night = g->hour() >= 20 || g->hour() < 6;
   if (inside) { if (!night || role != "villager") { inside = false; if (!inRoom.empty() && doorX >= 0) { x = doorX * TS + 8; y = (doorY + 1) * TS + 10; } inRoom.clear(); } else { moving = false; return; } }
   Ent* z = g->nearest(x, y, 80, [&](Ent* e) { return e->team == "undead" || (e->kind == E_SOLDIER && g->hostile(this, e)) || (e->kind == E_DOG && e->wild); });
-  if (z && role != "chief") { double dx = x - z->x, dy = y - z->y, d = std::hypot(dx, dy); if (d == 0) d = 1; move(dx / d * 42 * dt, dy / d * 42 * dt); dir = dirOf(-dx, -dy); moving = true; if (rnd() < 0.01) { static const char* H[] = {"Help!", "Zombies!", "Aaah!"}; say(pickA(H)); } return; }
+  if (z && role != "chief") { double dx = x - z->x, dy = y - z->y, d = std::hypot(dx, dy); if (d == 0) d = 1; drive(dx, dy, 44, dt, 12); /* run away facing away (was moon-walking toward the threat) */ if (rnd() < 0.01) { static const char* H[] = {"Help!", "Zombies!", "Aaah!"}; say(pickA(H)); } return; }
   if (night && role == "villager" && doorX >= 0) { held.clear(); task.clear(); chatWith = nullptr;
     if (seek(doorX * TS + 8, (doorY + 1) * TS + 8, speed * 1.3, dt, 6)) { inside = true; moving = false; Room* rec = g->interiorOf(vid, homeSi); if (rec) { inRoom = rec->key; x = (rec->x + 2 + ((id * 3) % std::max(1, rec->w - 4))) * TS + 8; y = (rec->y + 3 + (id % 2)) * TS + 8; dir = 0; } } return; }
-  if (role == "merchant" || role == "chief") { if (dist2d(x, y, hx, hy) > 400) seek(hx, hy, speed, dt); else { moving = false; Ent* p = g->player.get(); if (dist2d(p->x, p->y, x, y) < 4000) dir = dirOf(p->x - x, p->y - y); } return; }
+  if (role == "merchant" || role == "chief") { if (dist2d(x, y, hx, hy) > 400) seek(hx, hy, speed, dt); else { moving = false; Ent* p = g->player.get(); if (dist2d(p->x, p->y, x, y) < 4000) face(p->x - x, p->y - y); } return; }
   double h = g->hour(); Village* v = g->villageById(vid); bool work = (h < 11) || (h >= 14 && h < 18);
-  if (chatWith) { Ent* o = chatWith.get(); if (o->dead || o->inside) { chatWith = nullptr; return; } moving = false; dir = dirOf(o->x - x, o->y - y);
+  if (chatWith) { Ent* o = chatWith.get(); if (o->dead || o->inside) { chatWith = nullptr; return; } moving = false; face(o->x - x, o->y - y);
     if ((chatT -= dt) <= 0) { if (!chatLines.empty()) { auto ln = chatLines.front(); chatLines.erase(chatLines.begin()); (ln.first ? o : this)->say(ln.second, 2.6); chatT = 2.8; } else { o->chatWith = nullptr; chatWith = nullptr; wanderT = rndr(6, 12); } } return; }
   if (hasGoal) { bool done = seek(goal.x, goal.y, speed, dt, 3); wanderT -= dt; if (done || wanderT < -8) { task = goal.task; hasGoal = false; wanderT = rndr(3, 7); taskT = rndr(4, 9); } }
   else { moving = false;
@@ -85,7 +109,7 @@ void Ent::updateSoldier(double dt) {
   if (mine && hp < maxHp * 0.3 && target) { if (dist2d(x, y, p->x, p->y) > 900) { seek(p->x, p->y, speed * 1.3, dt, 16); if (rnd() < 0.01) say(rnd() < 0.5 ? "Falling back!" : "I need a moment!"); return; } }
   if (temp && g->day >= temp) { dead = true; g->toast(name + " returns to their clan."); return; } if (mine && hp < maxHp && !target) hp = std::min(maxHp, hp + dt * 0.5);
   if (!target || target->dead || dist2d(x, y, target->x, target->y) > 40000 || std::fmod(t, 1.0) < dt) { double range = order == "hold" ? 110 : 150; Ent* e = g->nearest(x, y, range, [&](Ent* e) { return g->hostile(this, e) && !e->dead && !e->inside; }); target = e ? g->sp(e) : nullptr; }
-  if (target) { Ent* T = target.get(); double d = std::hypot(T->x - x, T->y - y), reach = archer ? 90 : 18; dir = dirOf(T->x - x, T->y - y);
+  if (target) { Ent* T = target.get(); double d = std::hypot(T->x - x, T->y - y), reach = archer ? 90 : 18; if (d <= reach || archer) face(T->x - x, T->y - y);
     if (d > reach) seek(T->x, T->y, speed * 1.15, dt, reach * 0.8); else { moving = false; if (atkCd <= 0) { swing(archer ? 0.4 : 0.3); atkCd = archer ? 1.4 : 0.9; if (archer) g->shootArrow(this, T->x, T->y - 8, dmg); else { T->hurt(dmg, this); snd("hit", g->vol(x, y), 1, g->pan(x)); } } } return; }
   if (mine && order == "follow") { double ang = -PI / 2 + (slot % 6) / 6.0 * TAU, rr = 22 + (slot / 6) * 14; double fx = p->x + std::cos(ang) * rr, fy = p->y + std::sin(ang) * rr * 0.7, d2 = dist2d(x, y, fx, fy);
     if (d2 > 810000) { x = p->x; y = p->y; } if (d2 > 40) seek(fx, fy, d2 > 6400 ? speed * 1.6 : speed, dt, 4); else { moving = false; dir = p->dir; } return; }
@@ -100,8 +124,8 @@ void Ent::updateZombie(double dt) {
   if (g->daylight() > 0.55 && !raid) { burn += dt; if (rnd() < 0.3) { SpawnO o; o.x = x + rndr(-4, 4); o.y = y; o.z = rndr(6, 20); o.vz = 20; o.life = 0.6; static const u32 FC[3] = {0xFFff8a2a, 0xFFffd04a, 0xFF5a5050}; o.c = FC[(int)(rnd() * 3)]; g->fx.spawn(o); } if (burn > 4) hurt(999, nullptr); }
   if ((groanT -= dt) <= 0) { groanT = rndr(5, 14); if (dist2d(x, y, p->x, p->y) < 25600) snd("zombie", g->vol(x, y) * 0.7f, 1, g->pan(x)); }
   if (!target || target->dead || target->inside || std::fmod(t, 1.2) < dt) { Ent* e = g->nearest(x, y, raid ? 260 : 170, [&](Ent* e) { return e->team != "undead" && !e->dead && !e->inside && e->team != "wild" && (e->isPlayer || e->kind == E_VILLAGER || e->kind == E_SOLDIER || e->kind == E_DOG || e->livestock); }); target = e ? g->sp(e) : nullptr; }
-  if (target) { Ent* T = target.get(); double d = std::hypot(T->x - x, T->y - y); if (d > 13) seek(T->x, T->y, speed, dt, 10); else { moving = false; dir = dirOf(T->x - x, T->y - y); if (atkCd <= 0) { swing(0.4); atkCd = 1.1; T->hurt(dmg, this, 70); } }
-    if (stuck > 0.3 && std::fmod(t, 1.0) < dt) { int tx2 = (int)std::floor((x + DIRV[dir][0] * 10) / TS), ty2 = (int)std::floor((y - 2 + DIRV[dir][1] * 10) / TS); g->damageTile(tx2, ty2, 1, this, true); } return; }
+  if (target) { Ent* T = target.get(); double d = std::hypot(T->x - x, T->y - y); if (d > 13) seek(T->x, T->y, speed, dt, 10); else { moving = false; face(T->x - x, T->y - y); if (atkCd <= 0) { swing(0.4); atkCd = 1.1; T->hurt(dmg, this, 70); } }
+    if (stuckN >= 1 && std::fmod(t, 1.0) < dt) { int tx2 = (int)std::floor((x + DIRV[dir][0] * 10) / TS), ty2 = (int)std::floor((y - 2 + DIRV[dir][1] * 10) / TS); g->damageTile(tx2, ty2, 1, this, true); } return; }
   if (raid && hasRaidTo) { seek(raidX, raidY, speed, dt, 30); return; }
   if (hasGoal) { if (seek(goal.x, goal.y, speed * 0.6, dt, 3)) hasGoal = false; }
   else { moving = false; if ((wanderT -= dt) <= 0) { wanderT = rndr(2, 5); bool got = false; double bx = 0, by = 0; for (int k = 0; k < 4; k++) { double a = rnd() * TAU, gx = x + std::cos(a) * 50, gy = y + std::sin(a) * 50; if (!g->lit((int)std::floor(gx / 16), (int)std::floor(gy / 16))) { bx = gx; by = gy; got = true; break; } }
@@ -112,34 +136,56 @@ void Ent::updateDog(double dt) {
   if (down > 0) { down -= dt; state = "lie"; if (down <= 0) hp = maxHp * 0.5; return; }
   if (heartT > 0) { heartT -= dt; if (rnd() < dt * 4) { SpawnO o; o.x = x + rndr(-6, 6); o.y = y; o.z = 22; o.vz = 14; o.life = 1; o.c = C3(0xff6a8a); o.k = "heart"; g->fx.spawn(o); } }
   if (wild) return updateWild(dt);
-  if (!owned) { if (st > 4) { st = 0; static const char* S[] = {"sit", "sit", "idle", "walk", "lie"}; state = pickA(S); goal = {x + rndr(-40, 40), y + rndr(-30, 30), ""}; hasGoal = true; }
-    if (state == "walk" && hasGoal) { if (seek(goal.x, goal.y, 30, dt, 3)) state = "sit"; f = goal.x > x ? 1 : -1; } return; }
+  if (!owned) { if (state == "walk" && hasGoal) { if (seek(goal.x, goal.y, 28, dt, 3)) { hasGoal = false; state = "sit"; st = 0; } }
+    else if (st > 4) { st = 0; static const char* S[] = {"sit", "sit", "idle", "walk", "lie"}; state = pickA(S); moving = false; if (state == "walk") { goal = {x + rndr(-40, 40), y + rndr(-30, 30), ""}; hasGoal = true; path.clear(); } } return; }
   if (!target || target->dead || std::fmod(t, 0.8) < dt) { Ent* e = g->nearest(p->x, p->y, 110, [&](Ent* e) { return g->hostile(this, e) && !e->dead; }); target = e ? g->sp(e) : nullptr; }
-  if (target) { Ent* T = target.get(); double d = std::hypot(T->x - x, T->y - y); f = T->x > x ? 1 : -1; if (d > 14) { seek(T->x, T->y, speed * 1.15, dt, 10); state = "run"; } else { state = "bark"; if (atkCd <= 0) { atkCd = 0.75; vz = 70; T->hurt(dmg, this, 110); snd("growl", 0.6f, 1, g->pan(x)); } } return; }
-  double d = std::hypot(p->x - x, p->y - y); if (d > 520) { x = p->x - 12; y = p->y + 6; }
+  if (target) { Ent* T = target.get(); double d = std::hypot(T->x - x, T->y - y); faceX(T->x - x); if (d > 14) { seek(T->x, T->y, speed * 1.15, dt, 10); state = "run"; } else { state = "bark"; moving = false; if (atkCd <= 0) { atkCd = 0.75; vz = 70; T->hurt(dmg, this, 110); snd("growl", 0.6f, 1, g->pan(x)); } } return; }
+  double d = std::hypot(p->x - x, p->y - y); if (d > 520) { g->fx.burst(x, y - 4, 4, {C3(0xe8e0d0), C3(0xffffff)}, 10, 30, 6, 20, 60, 0.3, 0.5); x = p->x - 12; y = p->y + 6; path.clear(); svx = svy = 0; lxInit = false; g->fx.burst(x, y - 4, 4, {C3(0xe8e0d0), C3(0xffffff)}, 10, 30, 6, 20, 60, 0.3, 0.5); d = 20; }
   if (fetch) { Ent* s2 = fetch.get(); if (!carry) { if (s2->dead) { fetch = nullptr; return; } if (s2->z <= 0 && seek(s2->x, s2->y, speed * 1.2, dt, 6)) { s2->dead = true; carry = true; snd("pet", 0.4f); } else if (s2->z > 0) seek(s2->x, s2->y, speed * 1.2, dt, 6); state = "run"; return; }
     if (seek(p->x + 10, p->y + 4, speed, dt, 10)) { EP dr = g->dropItem("stick", 1, x + f * 6, y); dr->vz = 20; dr->pickDelay = 0.2; fetch = nullptr; carry = false; petDog(); love = std::min(100.0, love + 3); g->stats.fetches++; } state = "run"; return; }
-  if (d > 56) { double sp2 = d > 110 ? speed * 1.25 : speed * 0.7; seek(p->x - 14 * (p->x - x >= 0 ? 1 : -1), p->y + 4, sp2, dt, 4); state = d > 110 ? "run" : "walk"; f = p->x > x ? 1 : -1; st = 0; return; }
-  if (state == "run" || state == "walk") { state = "idle"; st = 0; }
+  if (d > 72) follow = true; else if (d < 34) follow = false; // hysteresis: no start/stop flapping at the threshold
+  if (follow) { double sx = p->dir & 1 ? 0 : (id & 1 ? 11 : -11), sy = p->dir & 1 ? (id & 1 ? 9 : -5) : 0; double tx2 = p->x - DIRV[p->dir][0] * 15 + sx, ty2 = p->y - DIRV[p->dir][1] * 12 + sy + 4; bool far = d > 130; if (seek(tx2, ty2, far ? speed * 1.3 : d > 95 ? speed : speed * 0.75, dt, 5)) follow = false; state = far || d > 100 ? "run" : "walk"; st = 0; return; }
+  if (state == "run" || state == "walk") { state = "idle"; st = 0; moving = false; }
   if (g->hour() >= 21 || g->hour() < 5) { if (st > 3 && p->idleT > 4) state = "sleep"; else if (state != "sleep") state = "lie"; } else if (st > rndr(5, 9)) { st = 0; static const char* S[] = {"sit", "sit", "idle", "lie", "sniff"}; state = pickA(S); }
   if ((barkT -= dt) <= 0) { barkT = rndr(14, 40); if (state != "sleep") { state = "bark"; st = 0; snd("bark", 0.5f, 1, g->pan(x)); } } if (state == "bark" && st > 0.8) state = "sit"; if (state == "happy" && st > 2.2) state = "sit"; }
 void Ent::updateWild(double dt) {
   if (!target || target->dead || std::fmod(t, 1.0) < dt) { Ent* e = g->nearest(x, y, 130, [&](Ent* e) { return (e->isPlayer || (e->kind == E_DOG && !e->wild) || e->livestock || ((e->kind == E_VILLAGER || e->kind == E_SOLDIER) && e->team != "undead")) && !e->dead && !e->inside; }); target = e ? g->sp(e) : nullptr; }
-  if (target) { Ent* T = target.get(); double d = std::hypot(T->x - x, T->y - y); f = T->x > x ? 1 : -1; if (d > 14) { seek(T->x, T->y, speed, dt, 10); state = "run"; } else { state = "bark"; if (atkCd <= 0) { atkCd = 1; vz = 60; T->hurt(dmg, this, 80); snd("growl", g->vol(x, y), 1, g->pan(x)); } } return; }
-  if (hasGoal) { state = "walk"; f = goal.x > x ? 1 : -1; if (seek(goal.x, goal.y, 30, dt, 3)) { hasGoal = false; state = "idle"; } } else if (st > 3) { st = 0; goal = {x + rndr(-60, 60), y + rndr(-50, 50), ""}; hasGoal = true; } }
+  if (target) { Ent* T = target.get(); double d = std::hypot(T->x - x, T->y - y); faceX(T->x - x);
+    if (lungeT > 0) { lungeT -= dt; drive(T->x - x, T->y - y, speed * 2.6, dt, 24); state = "run"; if (d < 13 && atkCd <= 0) { atkCd = 1; vz = 60; lungeT = 0; T->hurt(dmg, this, 80); snd("growl", g->vol(x, y), 1, g->pan(x)); } return; }
+    if (d > 14) { seek(T->x, T->y, speed * (d > 70 ? 1.2 : 0.95), dt, 10); state = "run"; if (d < 36 && atkCd <= 0 && rnd() < dt * 2.5) lungeT = 0.28; } /* stalk, then pounce */
+    else { state = "bark"; moving = false; if (atkCd <= 0) { atkCd = 1; vz = 60; T->hurt(dmg, this, 80); snd("growl", g->vol(x, y), 1, g->pan(x)); } } return; }
+  if (hasGoal) { state = "walk"; if (seek(goal.x, goal.y, 26, dt, 3)) { hasGoal = false; state = "idle"; st = 0; moving = false; } }
+  else if (st > 3) { st = 0; state = "idle"; Ent* mate = g->nearest(x, y, 140, [&](Ent* e) { return e != this && e->kind == E_DOG && e->wild && !e->dead; }); /* packs drift together */
+    goal = (mate && dist2d(x, y, mate->x, mate->y) > 900 && rnd() < 0.6) ? Goal2{mate->x + rndr(-24, 24), mate->y + rndr(-20, 20), ""} : Goal2{x + rndr(-60, 60), y + rndr(-50, 50), ""}; hasGoal = true; path.clear(); } }
 /* ---------------- animals ---------------- */
 void Ent::updateAnimal(double dt) {
   physics(dt); Ent* p = g->player.get(); const AniDef* D = def(); if (!D) return; if (baby > 0) baby -= dt;
   if (love2 > 0) { love2 -= dt; if (rnd() < dt * 3) { SpawnO o; o.x = x; o.y = y; o.z = 14; o.vz = 12; o.life = 1; o.c = C3(0xff6a8a); o.k = "heart"; g->fx.spawn(o); } Ent* m = g->nearest(x, y, 40, [&](Ent* e) { return e != this && e->kind == E_ANIMAL && e->akind == akind && e->love2 > 0 && e->baby <= 0; });
     if (m) { love2 = m->love2 = 0; g->spawnAnimal(akind, (x + m->x) / 2, (y + m->y) / 2, false, true, 240); g->fx.burst(x, y - 6, 10, {C3(0xff6a8a), C3(0xffd0e0)}); snd("pet"); g->toast("A baby " + akind + " was born!"); g->stats.born++; } }
   if (livestock && akind == "chicken" && (produceT -= dt) <= 0) { produceT = rndr(150, 300); g->dropItem("egg", 1, x, y); } if (shorn && (produceT -= dt) <= 0) { setShorn(false); produceT = rndr(150, 300); } if (milked > 0) milked -= dt;
-  if (D->aggro && angry && !angry->dead) { Ent* T = angry.get(); double d = std::hypot(T->x - x, T->y - y); if (d > 120) angry = nullptr; else { if (d > 12) { seek(T->x, T->y, speed, dt, 10); state = "walk"; } else if (atkCd <= 0) { atkCd = 1.2; T->hurt(3, this, 120); } return; } }
-  Ent* threat = D->flee ? g->nearest(x, y, D->flee > 1 ? 70 : 34, [&](Ent* e) { return (e->isPlayer && !g->holding(D->food)) || e->team == "undead" || e->team == "wild"; }) : nullptr;
-  if (threat || panic > 0) { if (panic > 0) panic -= dt; Ent* src2 = threat ? threat : panicSrc.get(); if (src2) { double dx = x - src2->x, dy = y - src2->y, d = std::hypot(dx, dy); if (d == 0) d = 1; move(dx / d * speed * 1.3 * dt, dy / d * speed * 1.3 * dt); f = dx > 0 ? 1 : -1; state = "walk"; return; } }
-  if (g->holding(D->food) && dist2d(p->x, p->y, x, y) < 8100 && dist2d(p->x, p->y, x, y) > 400) { seek(p->x, p->y, speed, dt, 18); state = "walk"; f = p->x > x ? 1 : -1; return; }
-  if (state == "walk" && hasGoal) { if (seek(goal.x, goal.y, speed * 0.5, dt, 2) || st < -5) { hasGoal = false; state = "idle"; st = rndr(2, 6); } else f = goal.x > x ? 1 : -1; }
-  else if (st <= 0) { if (rnd() < 0.5) { state = "walk"; auto herd = g->query(x, y, 80, [&](Ent* e) { return e != this && e->kind == E_ANIMAL && e->akind == akind; }); double hx2 = 0, hy2 = 0; for (Ent* e : herd) { hx2 += e->x; hy2 += e->y; }
-      goal = (!herd.empty() && rnd() < 0.6) ? Goal2{hx2 / herd.size() + rndr(-20, 20), hy2 / herd.size() + rndr(-16, 16), ""} : Goal2{x + rndr(-40, 40), y + rndr(-30, 30), ""}; hasGoal = true; st = 0; } else { state = rnd() < 0.5 ? "graze" : "idle"; st = rndr(2, 6); }
+  if (D->aggro && angry && !angry->dead) { Ent* T = angry.get(); double d = std::hypot(T->x - x, T->y - y); if (d > 120) angry = nullptr; else { faceX(T->x - x); if (d > 12) { seek(T->x, T->y, speed * 1.25, dt, 10); state = "run"; } else { moving = false; if (atkCd <= 0) { atkCd = 1.2; T->hurt(3, this, 120); } } return; } }
+  // ---- predator: wild foxes stalk wild rabbits/chickens (never the player's livestock), then rest after a kill ----
+  if (akind == "fox" && !livestock) { if (restT > 0) restT -= dt; else { Ent* prey = g->nearest(x, y, 110, [&](Ent* e) { return e->kind == E_ANIMAL && !e->dead && !e->livestock && (e->akind == "rabbit" || e->akind == "chicken"); });
+      if (prey) { double d = std::hypot(prey->x - x, prey->y - y); faceX(prey->x - x); if (d > 10) { seek(prey->x, prey->y, speed * (d > 50 ? 1.1 : 0.8), dt, 8); state = "run"; } else { moving = false; if (atkCd <= 0) { atkCd = 1.4; prey->hurt(3, this, 60); if (prey->dead) restT = 45; } } return; } } }
+  // ---- threat awareness: alert (freeze & watch) -> flee (herd alarm, zig-zag for small prey) -> cornered => freeze, never a treadmill ----
+  double fr = D->flee > 1 ? 70 : D->flee ? 34 : 0;
+  Ent* threat = fr > 0 ? g->nearest(x, y, fr * 1.4, [&](Ent* e) { return (e->isPlayer && !g->holding(D->food)) || e->team == "undead" || e->team == "wild" || (e->kind == E_ANIMAL && e->akind == "fox" && !e->livestock && (akind == "rabbit" || akind == "chicken")); }) : nullptr;
+  Ent* src2 = nullptr; if (threat) { double sd = std::hypot(threat->x - x, threat->y - y); if (sd < fr || fleeing) { src2 = threat; panic = std::max(panic, 1.3); panicSrc = g->sp(threat); } else { alertT = 0.45; } } else if (panic > 0 && panicSrc && !panicSrc->dead) src2 = panicSrc.get();
+  if (panic > 0) panic -= dt; if (alertT > 0) alertT -= dt;
+  if (src2 && panic > 0) { if (!fleeing) { fleeing = true; for (Ent* o : g->query(x, y, 70, [&](Ent* e) { return e != this && e->kind == E_ANIMAL && e->akind == akind && !e->fleeing; })) { o->panic = std::max(o->panic, 2.0); o->panicSrc = panicSrc; } }
+    double ux = x - src2->x, uy = y - src2->y; if (akind == "rabbit" || akind == "chicken") { double a = 0.85 * std::sin(t * 5.5 + id), c = std::cos(a), s = std::sin(a); double nx = ux * c - uy * s; uy = ux * s + uy * c; ux = nx; }
+    drive(ux, uy, speed * 1.45, dt, 13); state = "run"; if (stuckN >= 2) { panic = 0; fleeing = false; alertT = 1.2; stuckN = 0; state = "idle"; moving = false; svx = svy = 0; st = rndr(1, 2); } return; }
+  fleeing = false;
+  if (alertT > 0 && threat) { state = "alert"; moving = false; faceX(threat->x - x); return; }
+  if (state == "alert") { state = "idle"; st = rndr(1, 3); }
+  // ---- calves/lambs/chicks tag along with the nearest adult ----
+  if (baby > 0) { Ent* mom = g->nearest(x, y, 90, [&](Ent* e) { return e != this && e->kind == E_ANIMAL && e->akind == akind && e->baby <= 0 && !e->dead; }); if (mom && dist2d(mom->x, mom->y, x, y) > 576) { seek(mom->x + rndr(-6, 6), mom->y + 4, speed * 0.9, dt, 14); state = "walk"; return; } }
+  { double dd = dist2d(p->x, p->y, x, y); if (g->holding(D->food) && dd < 8100 && dd > 400) { seek(p->x, p->y, speed * 0.9, dt, 18); state = "walk"; if (livestock) { hx = x; hy = y; } return; } }
+  if (state == "walk" && hasGoal) { if (seek(goal.x, goal.y, speed * 0.5, dt, 2) || st < -10) { hasGoal = false; state = failed ? "idle" : (rnd() < 0.4 ? "graze" : "idle"); moving = false; st = rndr(2, 6); } }
+  else if (st <= 0) { if (rnd() < 0.5) { state = "walk"; double lim = hasPen ? 48 : 90; auto herd = g->query(x, y, 80, [&](Ent* e) { return e != this && e->kind == E_ANIMAL && e->akind == akind; }); double hx2 = 0, hy2 = 0; for (Ent* e : herd) { hx2 += e->x; hy2 += e->y; }
+      goal = (!herd.empty() && rnd() < 0.6) ? Goal2{hx2 / herd.size() + rndr(-20, 20), hy2 / herd.size() + rndr(-16, 16), ""} : Goal2{x + rndr(-40, 40), y + rndr(-30, 30), ""};
+      if (livestock && (hx != 0 || hy != 0) && dist2d(goal.x, goal.y, hx, hy) > lim * lim) { double a = std::atan2(goal.y - hy, goal.x - hx); goal.x = hx + std::cos(a) * lim * 0.8; goal.y = hy + std::sin(a) * lim * 0.8; } /* livestock stay near their pasture */
+      hasGoal = true; path.clear(); st = 0; } else { state = rnd() < 0.55 ? "graze" : "idle"; st = rndr(2, 6); moving = false; }
     if (D->sound[0] && rnd() < 0.15 && dist2d(p->x, p->y, x, y) < 22500) snd(D->sound, g->vol(x, y) * 0.6f, 1, g->pan(x)); } }
 /* ---------------- drops & arrows ---------------- */
 void Ent::updateDrop(double dt) { t += dt; life -= dt; pickDelay -= dt; if (life <= 0) { dead = true; return; }
@@ -223,7 +269,7 @@ EP Game::spawnSoldier(double x, double y, const std::string& vid, int color, boo
   e->team = mine ? "player" : "v:" + vid; e->hp = e->maxHp = archer ? 18 : 28; e->speed = 44; e->dmg = archer ? 3 : 4; e->held = archer ? "bow" : "spear"; e->order = order.empty() ? (mine ? "follow" : "patrol") : order; e->postX = px; e->postY = py; e->name = pickA(SNAMES); e->walkFps = 9; return add(e); }
 EP Game::spawnZombie(double x, double y, int kind) { EP e = mk(E_ZOMBIE, x, y); e->look = zombieLook(rndi(1, 1000000), kind); e->frames = bakeChar(e->look); e->zkind = kind; e->team = "undead"; static const double S[3][3] = {{16, 22, 2}, {10, 40, 2}, {42, 15, 4}}; e->hp = e->maxHp = S[kind][0] + day * 0.6; e->speed = S[kind][1]; e->dmg = S[kind][2] + (int)(day / 6); e->walkFps = 5; e->groanT = rndr(3, 10); return add(e); }
 EP Game::spawnDog(double x, double y, const std::string& breed, const std::string& name, bool owned, bool wild, double love) { EP e = mk(E_DOG, x, y); e->breed = breed; e->name = name; e->wild = wild; e->team = wild ? "wild" : (owned ? "player" : "nature"); e->owned = owned; e->persist = !wild; e->hp = e->maxHp = wild ? 14 : 30; e->speed = wild ? 62 : 74; e->r = 5; e->state = "sit"; e->love = love; e->dmg = wild ? 2 : 4; e->barkT = rndr(4, 12); e->swims = !wild; return add(e); }
-EP Game::spawnAnimal(const std::string& kind, double x, double y, bool pen, bool owned, double baby) { EP e = mk(E_ANIMAL, x, y); e->akind = kind; const AniDef& D = ANI[kind]; e->persist = owned || pen; e->livestock = owned || pen; e->hp = e->maxHp = D.hp; e->speed = D.sp; e->f = rnd() < 0.5 ? 1 : -1; e->state = "idle"; e->st = rndr(0, 3); e->r = kind == "cow" ? 6 : 4; e->baby = baby; e->produceT = rndr(60, 200); e->owned = owned; e->hasPen = pen; e->noWater = true; return add(e); }
+EP Game::spawnAnimal(const std::string& kind, double x, double y, bool pen, bool owned, double baby) { EP e = mk(E_ANIMAL, x, y); e->akind = kind; const AniDef& D = ANI[kind]; e->persist = owned || pen; e->livestock = owned || pen; e->hp = e->maxHp = D.hp; e->speed = D.sp; e->f = rnd() < 0.5 ? 1 : -1; e->state = "idle"; e->st = rndr(0, 3); e->r = kind == "cow" ? 6 : 4; e->baby = baby; e->hx = x; e->hy = y; e->produceT = rndr(60, 200); e->owned = owned; e->hasPen = pen; e->noWater = true; return add(e); }
 EP Game::dropItem(const std::string& id, int n, double x, double y) { EP e = mk(E_DROP, x + rndr(-3, 3), y + rndr(-3, 3)); e->item = id; e->n = n; e->vz = rndr(40, 70); e->z = 4; double a = rnd() * TAU; e->vx = std::cos(a) * rndr(10, 30); e->vy = std::sin(a) * rndr(6, 18); e->life = 300; e->solidEnt = false; e->team = "item"; e->pickDelay = 0.4; return add(e); }
 void Game::newGame(const GameOpts& o) {
   opts = o; world.init(o.seed); ents.clear(); nations.clear(); fx = FX(); diff = o.difficulty == "peaceful" ? 0 : o.difficulty == "hard" ? 1.6 : 1; clock = DAY_LEN * (2.0 / 24); day = 1; weather.rain = 0; weather.target = 0; weather.t = rndr(200, 500); weather.bolt = 6; stats = {}; goal = 0; prayed.clear(); koiFeeds = 0; hasSpawnPoint = false; interiors.clear(); inside = nullptr; raidOn = false; playTime = 0; hitstop = 0; toasts.clear(); dmg.clear(); shakeTiles.clear();
@@ -240,12 +286,12 @@ bool Game::hostile(Ent* a, Ent* b) { if (!a || !b || a == b) return false; const
   if (ta == "wild") return tb == "player" || b->livestock || b->hasTeam("v:"); if (tb == "wild") return ta == "player" || a->hasTeam("v:");
   auto war = [&](const std::string& t) { if (t.compare(0, 2, "v:")) return false; Nation* n = nationOf(t.substr(2)); return n && n->status == "war"; };
   if (ta == "player" && tb.compare(0, 2, "v:") == 0) return war(tb) && (b->kind == E_SOLDIER || b->isPlayer); if (tb == "player" && ta.compare(0, 2, "v:") == 0) return war(ta) && a->kind == E_SOLDIER; return false; }
-std::vector<std::pair<int, int>> Game::findPath(int sx, int sy, int tx, int ty) {
+std::vector<std::pair<int, int>> Game::findPath(int sx, int sy, int tx, int ty, bool avoidWater) {
   World& w = world; const int M = 14; int x0 = std::min(sx, tx) - M, y0 = std::min(sy, ty) - M, W = std::abs(tx - sx) + M * 2 + 1, H = std::abs(ty - sy) + M * 2 + 1; if (W * H > 5000) return {};
   int N = W * H; std::vector<float> gS(N, 1e9f); std::vector<int> from(N, -1); std::vector<u8> closed(N, 0); auto idx = [&](int x, int y) { return (y - y0) * W + (x - x0); }; int si = idx(sx, sy), ti = idx(tx, ty);
   typedef std::pair<float, int> PI_; std::priority_queue<PI_, std::vector<PI_>, std::greater<PI_>> open; gS[si] = 0; open.push({(float)(std::abs(tx - sx) + std::abs(ty - sy)), si}); int it = 0, best = si, bestH = 1000000;
   while (!open.empty() && it++ < 1400) { int ci = open.top().second; open.pop(); if (closed[ci]) continue; closed[ci] = 1; int cx = ci % W + x0, cy = ci / W + y0, h = std::abs(tx - cx) + std::abs(ty - cy); if (h < bestH) { bestH = h; best = ci; } if (ci == ti) break;
-    static const int D4[4][2] = {{1, 0}, {-1, 0}, {0, 1}, {0, -1}}; for (auto& d : D4) { int nx = cx + d[0], ny = cy + d[1]; if (nx < x0 || ny < y0 || nx >= x0 + W || ny >= y0 + H) continue; int ni = idx(nx, ny); if (closed[ni]) continue; bool sol = (nx != tx || ny != ty) ? w.solid(nx, ny) : false; if (sol) continue;
+    static const int D4[4][2] = {{1, 0}, {-1, 0}, {0, 1}, {0, -1}}; for (auto& d : D4) { int nx = cx + d[0], ny = cy + d[1]; if (nx < x0 || ny < y0 || nx >= x0 + W || ny >= y0 + H) continue; int ni = idx(nx, ny); if (closed[ni]) continue; bool sol = (nx != tx || ny != ty) ? (w.solid(nx, ny) || (avoidWater && isWater(w.ground(nx, ny)))) : false; if (sol) continue;
       float ng = gS[ci] + (isWater(w.ground(nx, ny)) ? 3 : 1); if (ng < gS[ni]) { gS[ni] = ng; from[ni] = ci; open.push({ng + std::abs(tx - nx) + std::abs(ty - ny), ni}); } } }
   std::vector<std::pair<int, int>> path; int c = best; while (c != si && c >= 0) { path.push_back({c % W + x0, c / W + y0}); c = from[c]; } std::reverse(path.begin(), path.end()); return path; }
 void Game::pickup(Ent* d) { Ent* p = player.get(); if (d->item == "coin") { p->coins += d->n; d->dead = true; snd("coin", 0.6f); toast("+" + std::to_string(d->n) + " coins", "coin", "coin"); return; }
@@ -373,9 +419,14 @@ void Game::update(double dt) {
   now += dt; if (paused) return; if (hitstop > 0) { hitstop -= dt; return; } playTime += dt; tickTime(dt); tickWeather(dt); rebuildGrid(); Ent* p = player.get(); p->update(dt);
   if (world.ground(p->tx(), p->ty()) == G_ONSEN) { onsT += dt; if (onsT > 1.5) { onsT = 0; if (p->hp < p->maxHp) p->hp++; if (!onsMsg) { onsMsg = true; toast("The hot spring soothes your aches.", "good"); } } }
   { int ptx = p->tx(), pty = p->ty(); if (inside) { if (world.obj(ptx, pty) == O_EXIT && p->dir == 0 && !fading) exitHouse(); } else if (p->moving && p->dir == 2 && !fading) { Village* v; Struct* s = doorAt(ptx, (int)std::floor((p->y - 6) / TS), v); if (s) enterHouse(v, s); } }
-  size_t n0 = ents.size(); for (size_t i = 0; i < n0; i++) { EP e = ents[i]; if (e->dead) continue; bool far = dist2d(e->x, e->y, p->x, p->y) > std::pow(60 * TS, 2); if (far && e->persist) continue; e->update(dt); }
-  for (auto& e : ents) if (e->solidEnt && !e->dead && e->kind != E_DROP && e->kind != E_ARROW) { auto others = query(e->x, e->y, 10, [&](Ent* o) { return o != e.get() && o->solidEnt && o->kind != E_DROP && o->kind != E_ARROW; });
-      for (Ent* o : others) { double dx = e->x - o->x, dy = e->y - o->y, d = std::hypot(dx, dy); if (d < 0.01) d = 0.01; if (d < 9 && !o->isPlayer) { double k = (9 - d) * 0.25; e->move(dx / d * k, dy / d * k); } } }
+  size_t n0 = ents.size(); for (size_t i = 0; i < n0; i++) { EP e = ents[i]; if (e->dead) continue; bool far = dist2d(e->x, e->y, p->x, p->y) > std::pow(60 * TS, 2); if (far && e->persist) continue; e->update(dt); if (e->kind != E_DROP && e->kind != E_ARROW) e->sampleMotion(dt); }
+  p->sampleMotion(dt);
+  // soft body separation: dt-scaled (frame-rate independent), skips idle/sleeping pairs' jitter via a dead zone, never shoves through walls
+  { std::vector<Ent*> others; for (auto& e : ents) if (e->solidEnt && !e->dead && e->kind != E_DROP && e->kind != E_ARROW && !e->inside) { others.clear(); double px = 0, py = 0; int cnt = 0;
+      query2(e->x, e->y, 10, [&](Ent* o) { if (o != e.get() && o->solidEnt && o->kind != E_DROP && o->kind != E_ARROW && !o->inside) others.push_back(o); }); if (dist2d(p->x, p->y, e->x, e->y) < 100) others.push_back(p);
+      for (Ent* o : others) { double dx = e->x - o->x, dy = e->y - o->y, d = std::hypot(dx, dy); if (d < 0.01) { dx = (e->id % 3) - 1.0; dy = 0.7; d = 1.2; } double R = (e->r + o->r) * 1.05 + 0.5; if (d < R - 0.4) { double k = (R - d) * 7.0 * dt; if (k > 1.2) k = 1.2; px += dx / d * k; py += dy / d * k; cnt++; } }
+      if (cnt) e->move(px, py, false); } }
+  for (auto& e : ents) { e->lx = e->x; e->ly = e->y; } p->lx = p->x; p->ly = p->y;
   ents.erase(std::remove_if(ents.begin(), ents.end(), [](const EP& e) { return e->dead; }), ents.end()); fx.update(dt);
   for (auto it = dmg.begin(); it != dmg.end();) { it->second.second -= dt; if (it->second.second <= 0) it = dmg.erase(it); else ++it; } for (auto it = shakeTiles.begin(); it != shakeTiles.end();) { it->second -= dt; if (it->second <= 0) it = shakeTiles.erase(it); else ++it; }
   randomTicks(dt); gl += dt; if (gl > 1) { gl = 0; if (goal < NGOALS && goalOk(goal)) { player->coins += GOALS[goal].r; snd("levelup"); toast(std::string("Goal complete: ") + GOALS[goal].t + " (+" + std::to_string(GOALS[goal].r) + " coins)", "good", "coin"); goal++; } }
