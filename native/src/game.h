@@ -9,12 +9,8 @@ enum { K_TAB = 9, K_ENTER = 13, K_SHIFT = 16, K_ESC = 27, K_SPACE = 32, K_LEFT =
 struct Input { bool down[256] = {}, hit[256] = {}; float mx = 0, my = 0; bool mouseOn = false, mdown[3] = {}, mhit[3] = {}; int wheel = 0; float padX = 0, padY = 0; bool padUse = false, padAlt = false, padRoll = false; std::string typed;
   bool d(int k) const { return down[k & 255]; } bool p(int k) const { return hit[k & 255]; } void endFrame() { memset(hit, 0, sizeof hit); mhit[0] = mhit[1] = mhit[2] = false; wheel = 0; padUse = padAlt = padRoll = false; typed.clear(); } };
 static Input IN;
-static void snd(const char* n, float vol = 1, float pitch = 1, float pan = 0) {
-  static const std::unordered_map<std::string, int> M = {{"step", S_STEP}, {"splash", S_SPLASH}, {"swing", S_SWING}, {"hit", S_HIT}, {"chop", S_CHOP}, {"mine", S_MINE}, {"pickup", S_PICKUP}, {"place", S_PLACE}, {"coin", S_COIN}, {"bell", S_BELL}, {"horn", S_HORN}, {"drum", S_DRUM}, {"error", S_ERROR}, {"levelup", S_LEVELUP},
-    {"break", S_BREAK}, {"arrow", S_ARROW}, {"eat", S_EAT}, {"bite", S_BITE}, {"cast", S_CAST}, {"reel", S_TICK}, {"catch", S_LEVELUP}, {"hurt", S_HURT}, {"zombie", S_GROAN}, {"zombieDie", S_DIE}, {"cow", S_MOO}, {"sheep", S_BAA}, {"chicken", S_CLUCK}, {"bark", S_BARK}, {"growl", S_WHINE}, {"pet", S_POP},
-    {"harvest", S_HARVEST}, {"plant", S_PLANT}, {"water", S_WATER}, {"door", S_DOOR}, {"till", S_PLANT}, {"death", S_DIE}, {"click", S_CLICK}, {"open", S_TICK}, {"close", S_TICK}, {"save", S_TICK}};
-  auto it = M.find(n); if (it != M.end()) Audio::play(it->second, vol, pitch, pan);
-}
+// every sound name is the original js/audio.js SFX name (the native engine is a 1:1 port of that synth)
+static void snd(const char* n, float vol = 1, float pitch = 1, float pan = 0) { Audio::play(n, vol, pitch, pan); }
 inline double rnd() { return frand(); } inline double rndr(double a, double b) { return a + frand() * (b - a); } inline int rndi(int a, int b) { return (int)std::floor(rndr(a, b + 1)); }
 template <class T> inline const T& rpk(const std::vector<T>& v) { return v[(size_t)(frand() * v.size())]; }
 inline int dirOf(double dx, double dy) { return std::fabs(dx) > std::fabs(dy) ? (dx > 0 ? 1 : 3) : (dy > 0 ? 0 : 2); }

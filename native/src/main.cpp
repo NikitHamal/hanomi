@@ -30,7 +30,7 @@ static void hotkeys(Game& g) { int m = g.modal; if (m == M_TITLE || m == M_NEW |
 static Img* appFrame(double dt, int W, int H) {
   Game& g = *GM; UI::winW = W; UI::winH = H; if (FB.w != W || FB.h != H) FB.alloc(W, H); UI::U = W >= 1700 ? 3 : 2; gFpsT += dt; gFrames++; if (gFpsT >= 0.5) { gFps = gFrames / gFpsT; gFpsT = 0; gFrames = 0; }
   bool titleMode = g.modal == M_TITLE || g.modal == M_NEW || g.modal == M_LOAD || ((g.modal == M_SETTINGS || g.modal == M_HELP) && UI::fromTitle); hotkeys(g); T = &FB;
-  if (titleMode || !g.player) { UI::drawTitle(g, dt, FB); T = &FB; Audio::setMood(0); }
+  if (titleMode || !g.player) { UI::drawTitle(g, dt, FB); T = &FB; Audio::music(Audio::MU_TITLE); Audio::ambient(0, 0, 0, 0); }
   else {
     int sc = std::max(1, (int)std::round(std::sqrt((double)W * H / 129600.0)) + SET.zoom); sc = std::max(1, sc); int vw = (W + sc - 1) / sc, vh = (H + sc - 1) / sc; g.viewW = vw; g.viewH = vh; g.scale = sc; REN.resize(vw, vh);
     g.paused = g.modal == M_PAUSE || g.modal == M_DEAD || g.modal == M_SETTINGS || g.modal == M_HELP || g.sleeping; if (g.modal == M_NONE || g.modal == M_INV || g.modal == M_CRAFT || g.modal == M_MAP || g.modal == M_REALM || g.modal == M_JOURNAL || g.modal == M_CHEST || g.modal == M_TRADE || g.modal == M_TALK || g.modal == M_CHIEF || g.modal == M_BANNER || g.modal == M_SOLDIER) {}
@@ -42,15 +42,16 @@ static Img* appFrame(double dt, int W, int H) {
     UI::drawHUD(g); UI::drawModals(g);
     double fa = g.fadeState ? g.fadeT : 0; if (g.sleeping) fa = std::max(fa, g.sleepT < 1.3 ? g.sleepT / 1.3 : std::max(0.0, 1 - (g.sleepT - 1.3) / 1.3)); if (fa > 0.01) { frect(0, 0, W, H, RGB(8, 6, 14, (int)(clampf((float)fa, 0, 1) * 255))); if (g.sleeping && fa > 0.6) textC("Zzz...", W / 2, H / 2 - 20, 40, 0xFFf6b8ca); }
     // audio direction
-    Ent* p = g.player.get(); std::string bm = g.world.biomeAt(p->tx(), p->ty()); Audio::setMood(g.mood == "battle" ? 2 : g.mood == "night" ? 1 : 0); Audio::rainT = (float)g.weather.rain; Audio::nightT = (float)(1 - g.daylight()); Audio::windV = (bm == "snow" || bm == "rock") ? 0.6f : 0.25f; Audio::inside = g.inside != nullptr; Audio::paused = false;
+    Ent* p = g.player.get(); std::string bm = g.world.biomeAt(p->tx(), p->ty()); Audio::music(g.mood == "battle" ? Audio::MU_BATTLE : g.mood == "night" ? Audio::MU_NIGHT : Audio::MU_DAY);
+    Audio::ambient((float)g.weather.rain, (bm == "snow" || bm == "rock") ? 0.6f : 0.25f, (float)(1 - g.daylight()), (p->waterLevel() > 0 || bm == "water" || bm == "beach") ? 0.7f : 0.15f);
   }
   T = &FB; drawCursor(g); if (UI::quitReq) gQuit = true; IN.endFrame(); return &FB; }
 static void writePPM(const Img& im, const std::string& path) { FILE* f = fopen(path.c_str(), "wb"); if (!f) return; fprintf(f, "P6\n%d %d\n255\n", im.w, im.h); std::vector<u8> row(im.w * 3); for (int y = 0; y < im.h; y++) { for (int x = 0; x < im.w; x++) { u32 c = im.p[(size_t)y * im.w + x]; row[x * 3] = cr(c); row[x * 3 + 1] = cg(c); row[x * 3 + 2] = cb(c); } fwrite(row.data(), 1, row.size(), f); } fclose(f); }
 #ifdef _WIN32
 static HWND hwnd; static BITMAPINFO bmi; static bool gFull = false; static RECT gSavedRect; static LONG gSavedStyle; static HWAVEOUT hwo; static WAVEHDR whdr[4]; static int16_t* abuf[4]; static HANDLE aEvt; static bool aRun = true; static HANDLE aThread;
-static DWORD WINAPI audioThread(LPVOID) { while (aRun) { WaitForSingleObject(aEvt, 50); for (int i = 0; i < 4; i++) if (whdr[i].dwFlags & WHDR_DONE) { Audio::mix(abuf[i], 1024); waveOutWrite(hwo, &whdr[i], sizeof(WAVEHDR)); } } return 0; }
+static DWORD WINAPI audioThread(LPVOID) { while (aRun) { WaitForSingleObject(aEvt, 50); for (int i = 0; i < 4; i++) if (whdr[i].dwFlags & WHDR_DONE) { Audio::mix(abuf[i], 512); waveOutWrite(hwo, &whdr[i], sizeof(WAVEHDR)); } } return 0; }
 static void audioStart() { WAVEFORMATEX wf = {}; wf.wFormatTag = WAVE_FORMAT_PCM; wf.nChannels = 2; wf.nSamplesPerSec = 44100; wf.wBitsPerSample = 16; wf.nBlockAlign = 4; wf.nAvgBytesPerSec = 44100 * 4; aEvt = CreateEvent(nullptr, FALSE, FALSE, nullptr); if (waveOutOpen(&hwo, WAVE_MAPPER, &wf, (DWORD_PTR)aEvt, 0, CALLBACK_EVENT) != MMSYSERR_NOERROR) { hwo = nullptr; return; }
-  for (int i = 0; i < 4; i++) { abuf[i] = (int16_t*)calloc(1024 * 2, 2); whdr[i] = {}; whdr[i].lpData = (LPSTR)abuf[i]; whdr[i].dwBufferLength = 1024 * 4; waveOutPrepareHeader(hwo, &whdr[i], sizeof(WAVEHDR)); Audio::mix(abuf[i], 1024); waveOutWrite(hwo, &whdr[i], sizeof(WAVEHDR)); } aThread = CreateThread(nullptr, 0, audioThread, nullptr, 0, nullptr); SetThreadPriority(aThread, THREAD_PRIORITY_ABOVE_NORMAL); }
+  for (int i = 0; i < 4; i++) { abuf[i] = (int16_t*)calloc(512 * 2, 2); whdr[i] = {}; whdr[i].lpData = (LPSTR)abuf[i]; whdr[i].dwBufferLength = 512 * 4; waveOutPrepareHeader(hwo, &whdr[i], sizeof(WAVEHDR)); Audio::mix(abuf[i], 512); waveOutWrite(hwo, &whdr[i], sizeof(WAVEHDR)); } aThread = CreateThread(nullptr, 0, audioThread, nullptr, 0, nullptr); SetThreadPriority(aThread, THREAD_PRIORITY_ABOVE_NORMAL); }
 static void toggleFullscreen() { if (!gFull) { gSavedStyle = GetWindowLong(hwnd, GWL_STYLE); GetWindowRect(hwnd, &gSavedRect); MONITORINFO mi = {sizeof mi}; GetMonitorInfo(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &mi); SetWindowLong(hwnd, GWL_STYLE, WS_POPUP | WS_VISIBLE); SetWindowPos(hwnd, HWND_TOP, mi.rcMonitor.left, mi.rcMonitor.top, mi.rcMonitor.right - mi.rcMonitor.left, mi.rcMonitor.bottom - mi.rcMonitor.top, SWP_FRAMECHANGED); gFull = true; } else { SetWindowLong(hwnd, GWL_STYLE, gSavedStyle); SetWindowPos(hwnd, nullptr, gSavedRect.left, gSavedRect.top, gSavedRect.right - gSavedRect.left, gSavedRect.bottom - gSavedRect.top, SWP_FRAMECHANGED | SWP_NOZORDER); gFull = false; } }
 static LRESULT CALLBACK wndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
   switch (m) {
@@ -80,6 +81,13 @@ int WINAPI WinMain(HINSTANCE hi, HINSTANCE, LPSTR, int) {
     QueryPerformanceCounter(&t1); double el = (double)(t1.QuadPart - t0.QuadPart) / fq.QuadPart - now; if (el < 1.0 / 60 - 0.0015) Sleep((DWORD)((1.0 / 60 - el) * 1000 - 1)); while (true) { QueryPerformanceCounter(&t1); double e2 = (double)(t1.QuadPart - t0.QuadPart) / fq.QuadPart - now; if (e2 >= 1.0 / 60 - 0.0004) break; } }
   aRun = false; if (hwo) { SetEvent(aEvt); WaitForSingleObject(aThread, 200); waveOutReset(hwo); } timeEndPeriod(1); return 0; }
 #else
+// Offline audio render for QA: writes a 16-bit stereo WAV and prints RMS/peak
+static void renderWav(const std::string& path, double secs, const std::function<void()>& setup) {
+  Audio::reset(); Audio::bypassComp = getenv("NOCOMP") != nullptr; setup(); int frames = (int)(secs * Audio::SR); std::vector<int16_t> buf((size_t)frames * 2); for (int i = 0; i < frames; i += 512) Audio::mix(&buf[(size_t)i * 2], std::min(512, frames - i));
+  double ss = 0; int pk = 0; for (int16_t v : buf) { ss += (double)v * v; pk = std::max(pk, (int)std::abs(v)); } fprintf(stderr, "%s rms=%.4f peak=%.3f\n", path.c_str(), std::sqrt(ss / buf.size()) / 32768.0, pk / 32768.0);
+  FILE* f = fopen(path.c_str(), "wb"); if (!f) return; u32 dl = (u32)buf.size() * 2, sr = Audio::SR, br = sr * 4; u16 ch = 2, bits = 16, fmt = 1, ba = 4; u32 sz = 36 + dl, fs = 16;
+  fwrite("RIFF", 1, 4, f); fwrite(&sz, 4, 1, f); fwrite("WAVEfmt ", 1, 8, f); fwrite(&fs, 4, 1, f); fwrite(&fmt, 2, 1, f); fwrite(&ch, 2, 1, f); fwrite(&sr, 4, 1, f); fwrite(&br, 4, 1, f); fwrite(&ba, 2, 1, f); fwrite(&bits, 2, 1, f); fwrite("data", 1, 4, f); fwrite(&dl, 4, 1, f); fwrite(buf.data(), 2, buf.size(), f); fclose(f);
+}
 // Headless QA: hanomi_headless script.txt outdir
 int main(int argc, char** argv) {
   std::string script = argc > 1 ? argv[1] : "", out = argc > 2 ? argv[2] : "shots"; int W = argc > 3 ? atoi(argv[3]) : 1280, H = argc > 4 ? atoi(argv[4]) : 720; if (system(("mkdir -p " + out).c_str())) {} appInit(out); FILE* f = fopen(script.c_str(), "r"); if (!f) { fprintf(stderr, "no script\n"); return 1; } char line[512]; std::vector<std::string> lines; while (fgets(line, sizeof line, f)) lines.push_back(line); fclose(f);
@@ -93,6 +101,9 @@ int main(int argc, char** argv) {
     else if (c == "modal") g.modal = (Modal)(int)f1; else if (c == "dir") g.player->dir = (int)f1; else if (c == "area") { UI::fromTitle = false; } else if (c == "talk") { Ent* best = nullptr; for (auto& e : g.ents) if (e->kind == E_VILLAGER && e->role == a1) best = e.get(); if (best) { g.player->x = best->x; g.player->y = best->y + 14; REN.inited = false; g.modalEnt = best; g.modal = a1[0] == 'c' ? M_CHIEF : a1[0] == 'm' ? M_TRADE : M_TALK; } }
     else if (c == "spawn") { std::string k = a1; double px = g.player->x + 3 * TS, py = g.player->y; if (k == "zombie") g.spawnZombie(px, py, 0); else if (k == "zombie2") g.spawnZombie(px, py, 2); else if (k == "soldier") g.spawnSoldier(px, py, "0,0", 0xe87a9a, false, true, "follow", px, py); else if (k == "archer") g.spawnSoldier(px, py, "0,0", 0xe87a9a, true, true, "follow", px, py); else if (k == "wolf") g.spawnDog(px, py, "wolf", "", false, true); else if (k == "dog") g.spawnDog(px, py, a2[0] ? a2 : "shiba", "Pochi", true, false); else g.spawnAnimal(k, px, py); }
     else if (c == "set") { int tx = (int)f2, ty = (int)atof(a2); (void)tx; (void)ty; } else if (c == "build") { int o = (int)f1; g.world.set(g.player->tx() + (int)f2 + 2, g.player->ty() + 1, -1, -1, o, 0); }
+    else if (c == "sfx") { std::string nm = a1; renderWav(out + "/sfx_" + nm + ".wav", f2 > 0 ? f2 : 2.0, [&] { Audio::play(nm.c_str(), 1, 1, 0); }); }
+    else if (c == "music") { int md = (int)f1; renderWav(out + "/music_" + a1 + ".wav", f2 > 0 ? f2 : 20.0, [&] { Audio::music(md); }); }
+    else if (c == "amb") { int k = (int)f1; renderWav(out + "/amb_" + a1 + ".wav", f2 > 0 ? f2 : 6.0, [&] { Audio::ambient(k == 0 ? 1.f : 0.f, k == 1 ? 1.f : 0.f, k == 2 ? 1.f : 0.f, k == 3 ? 1.f : 0.f); }); }
     else if (c == "shot") { step(2); writePPM(FB, out + "/" + a1 + ".ppm"); } else if (c == "perf") { fprintf(stderr, "frames=%d avg=%.2fms worst=%.2fms\n", frames, total / std::max(1, frames), worst); total = 0; frames = 0; worst = 0; }
     else if (c == "save") g.saveGame(); else if (c == "load") fprintf(stderr, "load=%d\n", g.loadGame()); else if (c == "stat") fprintf(stderr, "hp=%.1f food=%.1f coins=%d ents=%zu chunks=%zu day=%d hour=%.1f goal=%d\n", g.player->hp, g.player->food, g.player->coins, g.ents.size(), g.world.chunks.size(), g.day, g.hour(), g.goal); }
   fprintf(stderr, "done\n"); return 0; }
